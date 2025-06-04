@@ -1,0 +1,74 @@
+import pandas as pd
+import os
+
+# === Load file ===
+input_file = "6mo_KPI_Prophet_forecast.csv"
+if not os.path.exists(input_file):
+    print(f" File not found: {input_file}")
+    exit()
+
+df = pd.read_csv(input_file)
+df.columns = [col.strip().replace(" ", "_") for col in df.columns]
+
+# === Rename columns if needed ===
+rename_map = {}
+if "DL_Prb_Utilization" not in df.columns:
+    for col in df.columns:
+        if "PRB" in col.upper():
+            rename_map[col] = "DL_Prb_Utilization"
+        if "UE" in col.upper():
+            rename_map[col] = "Avg_UE_Number"
+df.rename(columns=rename_map, inplace=True)
+
+required_cols = ['Timestamp', 'NCI', 'DL_Prb_Utilization', 'Avg_UE_Number']
+for col in required_cols:
+    if col not in df.columns:
+        print(f" Missing column: {col}")
+        exit()
+
+# === Format columns ===
+df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+df = df.sort_values(by=['NCI', 'Timestamp'])
+
+df['DL_Prb_Utilization'] = pd.to_numeric(df['DL_Prb_Utilization'], errors='coerce')
+df['Avg_UE_Number'] = pd.to_numeric(df['Avg_UE_Number'], errors='coerce')
+
+# === Thresholds ===
+modes = {
+    "Conservative": {"DL_Prb_Utilization": 10, "Avg_UE_Number": 10},
+    "Moderate": {"DL_Prb_Utilization": 15, "Avg_UE_Number": 13},
+    "Aggressive": {"DL_Prb_Utilization": 20, "Avg_UE_Number": 17}
+}
+
+# === Find valid 30-min (2 rows) or more windows ===
+def filter_shutdown_rows(group, max_prb, max_ue):
+    group = group.copy()
+    group["valid"] = (group["DL_Prb_Utilization"] <= max_prb) & (group["Avg_UE_Number"] <= max_ue)
+    group["segment"] = (group["valid"] != group["valid"].shift()).cumsum()
+
+    valid_rows = []
+    for seg_val, seg_df in group.groupby("segment"):
+        if seg_df["valid"].iloc[0] and len(seg_df) >= 2:  # 2 x 15min = 30min
+            valid_rows.append(seg_df)
+
+    if valid_rows:
+        return pd.concat(valid_rows)
+    else:
+        return pd.DataFrame(columns=group.columns)
+
+# === Loop over modes ===
+for mode, limits in modes.items():
+    mode_filtered = []
+    for nci, nci_group in df.groupby("NCI"):
+        filtered = filter_shutdown_rows(nci_group, limits["DL_Prb_Utilization"], limits["Avg_UE_Number"])
+        if not filtered.empty:
+            mode_filtered.append(filtered)
+
+    if mode_filtered:
+        final_df = pd.concat(mode_filtered)
+    else:
+        final_df = pd.DataFrame(columns=df.columns)
+
+    out_csv = f"{mode.lower()}_mode_shutdown_rows.csv"
+    final_df.to_csv(out_csv, index=False)
+    print(f" {mode} → {len(final_df)} rows written to {out_csv}")
